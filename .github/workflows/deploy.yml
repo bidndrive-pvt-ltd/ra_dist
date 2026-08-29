@@ -5,9 +5,14 @@ on:
     branches:
       - main
 
+concurrency:
+  group: frontend-production
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: 🚀 Deploy frontend dist to server via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -16,51 +21,223 @@ jobs:
           username: root
           key: ${{ secrets.SSH_KEY }}
           port: 22
+          timeout: 60s
+          command_timeout: 10m
+
           script: |
-            set -e
+            set -Eeuo pipefail
+
             # ================= CONFIG =================
-            REPO_DIR="/var/www/ra"          # git repo AND nginx serving dir (same, so we handle the zip carefully)
-            ZIP_PATTERN="dist*.zip"
+            REPO_DIR="/var/www/ra"
             OWNER="www-data"
             GROUP="www-data"
+            ZIP_PATTERN="dist*.zip"
+            DEPLOY_DIR="/var/www/ra_deploy"
             # ==========================================
-            echo "📁 Moving to repo directory"
+
+            echo "======================================"
+            echo "🚀 Starting frontend deployment"
+            echo "======================================"
+
+            # ------------------------------------------
+            # 1. Go to repository
+            # ------------------------------------------
+
+            echo "📁 Repository: $REPO_DIR"
+
             cd "$REPO_DIR"
-            echo "📥 Pulling latest code"
-            git pull origin main
-            echo "🔍 Checking unzip availability"
-            if ! command -v unzip >/dev/null 2>&1; then
-              echo "📦 unzip not found, installing..."
-              sudo apt update
-              sudo apt install unzip -y
-            fi
-            echo "📦 Locating latest dist zip"
-            ZIP_FILE=$(ls -t $ZIP_PATTERN 2>/dev/null | head -n 1)
-            if [ -z "$ZIP_FILE" ]; then
-              echo "❌ No dist zip found"
+
+            # ------------------------------------------
+            # 2. Update repository
+            # ------------------------------------------
+
+            echo "📥 Fetching latest code"
+
+            git fetch origin main
+
+            git reset --hard origin/main
+
+            # ------------------------------------------
+            # 3. Find latest dist ZIP
+            # ------------------------------------------
+
+            echo "📦 Searching for dist ZIP"
+
+            ZIP_FILE=$(find "$REPO_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name "$ZIP_PATTERN" \
+              -printf '%T@ %p\n' 2>/dev/null \
+              | sort -nr \
+              | head -n 1 \
+              | cut -d' ' -f2-)
+
+            if [ -z "${ZIP_FILE:-}" ]; then
+              echo "❌ No dist ZIP found"
               exit 1
             fi
-            echo "✅ Using zip: $ZIP_FILE"
-            echo "🧪 Verifying zip integrity"
-            if ! unzip -t "$ZIP_FILE" >/dev/null 2>&1; then
-              echo "❌ Zip file is corrupt or unreadable: $ZIP_FILE"
+
+            echo "✅ ZIP found:"
+            echo "$ZIP_FILE"
+
+            # ------------------------------------------
+            # 4. Verify ZIP
+            # ------------------------------------------
+
+            echo "🧪 Checking ZIP integrity"
+
+            unzip -t "$ZIP_FILE" >/dev/null
+
+            echo "✅ ZIP is valid"
+
+            # ------------------------------------------
+            # 5. Create temporary deployment directory
+            # ------------------------------------------
+
+            echo "📁 Creating temporary deployment directory"
+
+            rm -rf "$DEPLOY_DIR"
+            mkdir -p "$DEPLOY_DIR"
+
+            # ------------------------------------------
+            # 6. Extract frontend
+            # ------------------------------------------
+
+            echo "📦 Extracting frontend"
+
+            unzip -q "$ZIP_FILE" -d "$DEPLOY_DIR"
+
+            # ------------------------------------------
+            # 7. Detect nested dist directory
+            # ------------------------------------------
+
+            if [ -d "$DEPLOY_DIR/dist" ]; then
+              echo "📂 Found nested dist directory"
+
+              mv "$DEPLOY_DIR/dist/"* "$DEPLOY_DIR/" 2>/dev/null || true
+              mv "$DEPLOY_DIR/dist/".[!.]* "$DEPLOY_DIR/" 2>/dev/null || true
+
+              rm -rf "$DEPLOY_DIR/dist"
+            fi
+
+            # ------------------------------------------
+            # 8. Validate extracted frontend
+            # ------------------------------------------
+
+            echo "🔍 Validating deployment"
+
+            if [ ! -f "$DEPLOY_DIR/index.html" ]; then
+              echo "❌ index.html not found"
+              echo "❌ Deployment cancelled"
+              rm -rf "$DEPLOY_DIR"
               exit 1
             fi
-            echo "📋 Copying zip to safe temp location before cleanup"
-            SAFE_ZIP="/tmp/$(basename "$ZIP_FILE")"
-            cp "$ZIP_FILE" "$SAFE_ZIP"
-            echo "🧹 Cleaning old frontend files (keeping .git)"
-            find "$REPO_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec sudo rm -rf {} +
-            echo "📦 Extracting dist"
-            sudo unzip -o "$SAFE_ZIP" -d "$REPO_DIR"
+
+            echo "✅ index.html found"
+
+            # ------------------------------------------
+            # 9. Set ownership
+            # ------------------------------------------
+
             echo "👤 Setting ownership"
-            sudo chown -R "$OWNER":"$GROUP" "$REPO_DIR"
-            sudo chown -R root:root "$REPO_DIR/.git"
+
+            chown -R "$OWNER:$GROUP" "$DEPLOY_DIR"
+
+            # ------------------------------------------
+            # 10. Set safe permissions
+            # ------------------------------------------
+
             echo "🔐 Setting permissions"
-            sudo find "$REPO_DIR" -path "$REPO_DIR/.git" -prune -o -type d -exec chmod 775 {} \;
-            sudo find "$REPO_DIR" -path "$REPO_DIR/.git" -prune -o -type f -exec chmod 775 {} \;
-            echo "🧽 Cleaning up temp zip"
-            rm -f "$SAFE_ZIP"
+
+            find "$DEPLOY_DIR" -type d -exec chmod 755 {} \;
+            find "$DEPLOY_DIR" -type f -exec chmod 644 {} \;
+
+            # ------------------------------------------
+            # 11. Backup current frontend
+            # ------------------------------------------
+
+            BACKUP_DIR="/var/www/ra_backup"
+
+            echo "💾 Creating backup"
+
+            rm -rf "$BACKUP_DIR"
+
+            mkdir -p "$BACKUP_DIR"
+
+            if [ -f "$REPO_DIR/index.html" ]; then
+              find "$REPO_DIR" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                ! -name '.git' \
+                ! -name 'dist*.zip' \
+                -exec cp -a {} "$BACKUP_DIR/" \;
+            fi
+
+            # ------------------------------------------
+            # 12. Replace frontend
+            # ------------------------------------------
+
+            echo "🔄 Replacing frontend"
+
+            find "$REPO_DIR" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              ! -name '.git' \
+              ! -name 'dist*.zip' \
+              -exec rm -rf {} +
+
+            cp -a "$DEPLOY_DIR/." "$REPO_DIR/"
+
+            # ------------------------------------------
+            # 13. Verify live deployment
+            # ------------------------------------------
+
+            echo "🔍 Verifying live frontend"
+
+            if [ ! -f "$REPO_DIR/index.html" ]; then
+              echo "❌ Live deployment failed"
+
+              echo "🔄 Restoring backup"
+
+              find "$REPO_DIR" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                ! -name '.git' \
+                ! -name 'dist*.zip' \
+                -exec rm -rf {} +
+
+              cp -a "$BACKUP_DIR/." "$REPO_DIR/"
+
+              rm -rf "$DEPLOY_DIR"
+
+              exit 1
+            fi
+
+            # ------------------------------------------
+            # 14. Nginx config test
+            # ------------------------------------------
+
+            echo "🧪 Testing nginx configuration"
+
+            nginx -t
+
+            # ------------------------------------------
+            # 15. Reload nginx
+            # ------------------------------------------
+
             echo "🔄 Reloading nginx"
-            sudo systemctl reload nginx
+
+            systemctl reload nginx
+
+            # ------------------------------------------
+            # 16. Cleanup
+            # ------------------------------------------
+
+            echo "🧹 Cleaning temporary files"
+
+            rm -rf "$DEPLOY_DIR"
+            rm -rf "$BACKUP_DIR"
+
+            echo "======================================"
             echo "🎉 Frontend deployed successfully"
+            echo "======================================"
