@@ -1,0 +1,63 @@
+name: Deploy Frontend Dist
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🚀 Deploy frontend dist to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: root
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            # ================= CONFIG =================
+            WORK_DIR="/root/ra_dist"        # where the ra_dist git repo (containing the zip) is cloned
+            TARGET_DIR="/var/www/ra"        # nginx serving directory — must be different from WORK_DIR
+            ZIP_PATTERN="dist*.zip"
+            OWNER="www-data"
+            GROUP="www-data"
+            # ==========================================
+            echo "📁 Moving to dist repository"
+            cd "$WORK_DIR"
+            echo "📥 Pulling latest code"
+            git pull origin main
+            echo "🔍 Checking unzip availability"
+            if ! command -v unzip >/dev/null 2>&1; then
+              echo "📦 unzip not found, installing..."
+              sudo apt update
+              sudo apt install unzip -y
+            fi
+            echo "📦 Locating latest dist zip"
+            ZIP_FILE=$(ls -t $ZIP_PATTERN 2>/dev/null | head -n 1)
+            if [ -z "$ZIP_FILE" ]; then
+              echo "❌ No dist zip found"
+              exit 1
+            fi
+            echo "✅ Using zip: $ZIP_FILE"
+            ZIP_FULL_PATH="$WORK_DIR/$ZIP_FILE"
+            echo "🧪 Verifying zip integrity"
+            if ! unzip -t "$ZIP_FULL_PATH" >/dev/null 2>&1; then
+              echo "❌ Zip file is corrupt or unreadable: $ZIP_FILE"
+              exit 1
+            fi
+            echo "🧹 Cleaning old frontend files"
+            sudo mkdir -p "$TARGET_DIR"
+            sudo rm -rf "${TARGET_DIR:?}"/*
+            echo "📦 Extracting dist"
+            sudo unzip -o "$ZIP_FULL_PATH" -d "$TARGET_DIR"
+            echo "👤 Setting ownership"
+            sudo chown -R "$OWNER":"$GROUP" "$TARGET_DIR"
+            echo "🔐 Setting permissions"
+            sudo find "$TARGET_DIR" -type d -exec chmod 775 {} \;
+            sudo find "$TARGET_DIR" -type f -exec chmod 775 {} \;
+            echo "🔄 Reloading nginx"
+            sudo systemctl reload nginx
+            echo "🎉 Frontend deployed successfully"
